@@ -17,6 +17,8 @@ build/
 *.swp
 *.swo
 
+venv/
+
 # Generated outputs
 gitex_exhibitors*.csv
 company_contacts*.csv

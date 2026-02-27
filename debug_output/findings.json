@@ -1,0 +1,14 @@
+{
+  "http_links": [],
+  "emails_in_html": "NOT FOUND - checking regex on full content",
+  "any_emails_in_html": [],
+  "ai_overview_exists": false,
+  "selector_div.g": 0,
+  "selector_div[data-hveid]": 0,
+  "selector_div.yuRUbf": 0,
+  "selector_div.VwiC3b": 0,
+  "selector_cite": 0,
+  "body_text_length": 770,
+  "body_contains_42gears": true,
+  "body_contains_sales": false
+}

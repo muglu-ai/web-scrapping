@@ -51,8 +51,37 @@ python company_contact_scraper.py gitex_exhibitors.csv -o gitex_contacts
 # Limit to first 5 companies (for testing)
 python company_contact_scraper.py companies_sample.json --max 5
 
+# Use DuckDuckGo instead of Google (avoids CAPTCHA; recommended)
+python company_contact_scraper.py companies_sample.json --duckduckgo
+
 # Do not block images/ads (slower but more realistic)
 python company_contact_scraper.py companies_sample.json --no-block
 ```
 
 Output: `company_contacts.json` and `company_contacts.csv`.
+
+**Note:** Google often shows CAPTCHA for automated traffic. Use `--duckduckgo` to bypass; the script also auto-falls back to DuckDuckGo when CAPTCHA is detected.
+
+---
+
+## 3. Company Contact Enrichment (Google, Non-Headless)
+
+Runs Chromium in **visible mode** for minimal CAPTCHA risk. Pauses for manual solve when reCAPTCHA is detected.
+
+### Features
+- Non-headless browser (en-IN locale, realistic viewport)
+- Manual CAPTCHA pause: solve in browser, press Enter to continue
+- Knowledge panel extraction
+- Confidence scoring for website selection
+- CAPTCHA encounter logging to `captcha_encounters.json`
+
+### Usage
+```bash
+# Process companies (browser window will open)
+python company_contact_enrichment.py companies_sample.json -o enrichment_results
+
+# Limit to first 2 companies
+python company_contact_enrichment.py companies_sample.json --max 2
+```
+
+Output: `enrichment_results.json`, `enrichment_results.csv`, `enrichment.log`

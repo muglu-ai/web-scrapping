@@ -17,7 +17,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
+
+import requests
 
 from playwright.sync_api import Page, Route, sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -62,7 +64,17 @@ EXCLUDED_DOMAINS = {
     "press-release",
     "news.",
     "blog.",
+    "duckduckgo.com",
+    "w3.org",
+    "w3.org.",
 }
+
+# Third-party directories to exclude when picking official website
+for _d in ("zoominfo.com", "dial4trade.com", "zaubacorp.com", "cleartax.in",
+           "salezshark.com", "craft.co", "insiderbiz.in", "indiabiz.info",
+           "gust.com", "glassdoor.com", "emis.com", "indiamart.com", "f6s.com",
+           "bulwarktech.com", "bdsoft.in", "datanyze.com"):
+    EXCLUDED_DOMAINS.add(_d)
 
 # Regex patterns for extraction
 EMAIL_PATTERN = re.compile(
@@ -181,32 +193,68 @@ def pick_best_website(urls: list[str], company_name: str, country: str) -> str:
 
 # ============ Extraction Helpers ============
 
+def strip_html(text: str) -> str:
+    """Remove HTML tags from text."""
+    if not text:
+        return ""
+    return re.sub(r"<[^>]+>", " ", text).replace("&nbsp;", " ").replace("&amp;", "&")
+
+
 def extract_emails(text: str) -> list[str]:
     """Extract and normalize email addresses from text."""
     if not text:
         return []
+    text = strip_html(text)
     found = set(EMAIL_PATTERN.findall(text))
     # Basic validation - filter obvious non-emails
+    skip_domains = ("example.com", "test.com", "domain.com", "duckduckgo.com", "wixpress.com")
+    skip_suffixes = (".png", ".jpg", ".gif", "xxx", "sentry.io", "google.com")
     valid = []
     for e in found:
         e = e.strip().lower()
         if len(e) > 5 and "@" in e and "." in e.split("@")[-1]:
-            if not any(x in e for x in ["example.com", "test.com", "domain.com", ".png", ".jpg", "xxx"]):
-                valid.append(e)
+            if not any(x in e for x in skip_domains):
+                if not any(e.endswith(x) or x in e for x in skip_suffixes):
+                    valid.append(e)
     return sorted(set(valid))
 
 
+# Stricter patterns for real phone numbers (reduces false positives from prices, IDs)
+PHONE_INTERNATIONAL = re.compile(r"\+\d{1,4}[-.\s]?\d{2,4}[-.\s]?\d{3,4}[-.\s]?\d{3,4}(?:[-.\s]?\d{2,4})?")
+PHONE_INDIAN = re.compile(r"(?:\+91|91|0)?[-.\s]?\d{4,5}[-.\s]?\d{5}")
+
+
 def extract_phones(text: str) -> list[str]:
-    """Extract and normalize phone numbers from text."""
+    """Extract and normalize phone numbers from text. Prefers international/Indian formats."""
     if not text:
         return []
-    found = PHONE_PATTERN.findall(text)
+    text = strip_html(text)
     valid = []
-    for p in found:
+    for pattern in (PHONE_INTERNATIONAL, PHONE_INDIAN):
+        for m in pattern.finditer(text):
+            p = m.group(0).strip()
+            digits = re.sub(r"\D", "", p)
+            if 10 <= len(digits) <= 15:
+                valid.append(p)
+    if not valid:
+        for m in PHONE_PATTERN.finditer(text):
+            p = m.group(0).strip()
+            digits = re.sub(r"\D", "", p)
+            if 10 <= len(digits) <= 12 and not any(c in p for c in [".", "e", "E"]):
+                valid.append(p)
+    # Prefer international format (+XX) and deduplicate; filter junk
+    junk_digits = {"2147483647", "1234567890", "12345678901", "9999999999"}
+    seen = set()
+    ordered = []
+    for p in valid:
         digits = re.sub(r"\D", "", p)
-        if 7 <= len(digits) <= 15:  # Reasonable phone length
-            valid.append(p.strip())
-    return list(dict.fromkeys(valid))  # Preserve order, remove dupes
+        if digits in seen or digits in junk_digits:
+            continue
+        seen.add(digits)
+        ordered.append(p)
+    # Put +XX numbers first
+    ordered.sort(key=lambda x: (0 if x.strip().startswith("+") else 1, x))
+    return ordered[:10]  # Limit to 10 most likely
 
 
 def extract_social_links(html: str) -> list[str]:
@@ -217,6 +265,76 @@ def extract_social_links(html: str) -> list[str]:
     return sorted(links)
 
 
+# Domain pattern for bare domains in text (e.g. "42gears.com" in AI Overview)
+DOMAIN_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?([a-zA-Z0-9][-a-zA-Z0-9]*\.(?:com|org|net|io|co|in|de|uk|fr|ae)[^\s\"'<>]*)",
+    re.IGNORECASE
+)
+# Address/location hints in text
+ADDRESS_HINT_PATTERN = re.compile(
+    r"(?:headquartered in|based in|located in|office in|HQ in)\s+([^.]+?)(?:\.|$)",
+    re.IGNORECASE
+)
+
+
+def extract_domains_from_text(text: str) -> list[str]:
+    """Extract website domains from text (e.g. AI Overview '42gears.com')."""
+    if not text:
+        return []
+    text = strip_html(text)
+    found = []
+    for m in DOMAIN_PATTERN.finditer(text):
+        domain = m.group(1).rstrip(".,;:)")
+        if "/" in domain:
+            domain = domain.split("/")[0]
+        domain = domain.lower()
+        if not any(ex in domain for ex in EXCLUDED_DOMAINS):
+            full = f"https://{domain}" if not domain.startswith("http") else domain
+            found.append(full)
+    return list(dict.fromkeys(found))
+
+
+def extract_address_from_text(text: str) -> str:
+    """Extract address/location hints like 'headquartered in Bengaluru'."""
+    if not text:
+        return ""
+    text = strip_html(text)
+    for m in ADDRESS_HINT_PATTERN.finditer(text):
+        addr = m.group(1).strip()
+        if 3 < len(addr) < 150:
+            return addr
+    return ""
+
+
+def get_ai_overview_text(page: Page) -> str:
+    """
+    Extract text from Google's AI Overview section if present.
+    Uses flexible text-based locators; traverses DOM to find the overview block.
+    """
+    for marker in ["AI Overview", "Key Contact Information"]:
+        try:
+            loc = page.get_by_text(marker, exact=False).first
+            # Use evaluate to traverse up and find a parent block with substantial content
+            txt = loc.evaluate(
+                """
+                el => {
+                    let p = el;
+                    for (let i = 0; i < 8 && p; i++) {
+                        const text = p.innerText || '';
+                        if (text.length > 150 && text.length < 8000) return text;
+                        p = p.parentElement;
+                    }
+                    return '';
+                }
+                """
+            )
+            if txt and len(txt) > 150:
+                return txt
+        except Exception:
+            continue
+    return ""
+
+
 def normalize_result(result: CompanyResult) -> CompanyResult:
     """Deduplicate and normalize extracted data."""
     result.emails = list(dict.fromkeys(result.emails))
@@ -225,6 +343,97 @@ def normalize_result(result: CompanyResult) -> CompanyResult:
     if result.address:
         result.address = " ".join(result.address.split())
     return result
+
+
+# ============ CAPTCHA & Fallback Detection ============
+
+def is_google_captcha_page(page: Page) -> bool:
+    """Detect if Google returned CAPTCHA instead of search results."""
+    try:
+        html = page.content()
+        if "recaptcha" in html.lower() or "unusual traffic" in html.lower():
+            if len(html) < 20000:  # Real SERP is usually 50KB+
+                return True
+            if page.locator("#captcha-form, .g-recaptcha").count() > 0:
+                return True
+            if page.locator("div.g").count() == 0:  # No organic results
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def fetch_duckduckgo_html(query: str) -> str:
+    """Fetch DuckDuckGo HTML via requests (avoids browser detection)."""
+    url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    r = requests.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    return r.text
+
+
+def extract_from_duckduckgo(page: Page, company_name: str, country: str) -> tuple[list[str], CompanyResult]:
+    """
+    Search via DuckDuckGo HTML. Uses requests (not Playwright) to avoid bot detection.
+    Extracts URLs from uddg redirect links and contact info from snippets.
+    """
+    result = CompanyResult(
+        company_name=company_name,
+        country=country,
+        sector="",
+        source=["duckduckgo"],
+    )
+    candidate_urls: list[str] = []
+
+    try:
+        # Shorter query ranks official site higher; "contact" skews DDG to directories
+        query = f'"{company_name}" {country} official website'
+        html = fetch_duckduckgo_html(query)
+        _random_delay(0.5, 1)
+
+        # Skip if DDG returned error page
+        if "Error getting results" in html or len(html) < 3000:
+            logger.warning("DuckDuckGo returned error or empty page")
+            return candidate_urls, result
+
+        # Extract target URLs from DuckDuckGo redirect links: ...uddg=URL_ENCODED...
+        uddg_pattern = re.compile(r'uddg=([^&"\']+)')
+        for m in uddg_pattern.finditer(html):
+            try:
+                decoded = unquote(m.group(1))
+                if not decoded.startswith("http"):
+                    continue
+                if "duckduckgo" in decoded.lower() or "subject=" in decoded or "feedback" in decoded:
+                    continue
+                parsed = urlparse(decoded)
+                domain = (parsed.netloc or "").lower()
+                if any(ex in domain for ex in EXCLUDED_DOMAINS):
+                    continue
+                candidate_urls.append(decoded)
+            except Exception:
+                continue
+
+        # Extract contact info from page text (snippets contain emails, phones, addresses)
+        result.emails = extract_emails(html)
+        result.phones = extract_phones(html)
+        result.social_links = extract_social_links(html)
+        result.address = extract_address_from_text(html) or ""
+        ai_domains = extract_domains_from_text(html)
+        if ai_domains:
+            candidate_urls = list(dict.fromkeys(ai_domains + candidate_urls))
+
+        if candidate_urls:
+            best = pick_best_website(candidate_urls[:20], company_name, country)
+            if best and "duckduckgo" not in best.lower():
+                result.website = best
+    except Exception as e:
+        logger.warning("DuckDuckGo extraction error: %s", e)
+
+    return candidate_urls, result
 
 
 # ============ Google Consent ============
@@ -256,6 +465,7 @@ def _random_delay(lo: float = MIN_DELAY, hi: float = MAX_DELAY) -> None:
 def extract_from_google_results(page: Page, company_name: str, country: str) -> tuple[list[str], CompanyResult]:
     """
     Extract candidate URLs and any visible contact info from Google search results.
+    Handles AI Overview section when present for richer contact data.
     Returns (list of candidate URLs, partial CompanyResult with google-sourced data).
     """
     result = CompanyResult(
@@ -267,14 +477,28 @@ def extract_from_google_results(page: Page, company_name: str, country: str) -> 
     candidate_urls: list[str] = []
 
     try:
-        # Get page HTML for regex extraction
+        # Get full page content for regex extraction
         content = page.content()
         result.emails = extract_emails(content)
         result.phones = extract_phones(content)
         result.social_links = extract_social_links(content)
 
+        # Try to extract from AI Overview section (richer structured data)
+        ai_text = get_ai_overview_text(page)
+        ai_domains: list[str] = []
+        if ai_text:
+            logger.debug("Found AI Overview section")
+            ai_emails = extract_emails(ai_text)
+            ai_phones = extract_phones(ai_text)
+            if ai_emails:
+                result.emails = list(dict.fromkeys(ai_emails + result.emails))
+            if ai_phones:
+                result.phones = list(dict.fromkeys(ai_phones + result.phones))
+            ai_domains = extract_domains_from_text(ai_text)
+            if not result.address:
+                result.address = extract_address_from_text(ai_text)
+
         # Collect organic result links - use flexible selectors
-        # Google uses various structures: div.g, div[data-hveid], a[href^="http"]
         links = page.locator('a[href^="http"]').all()
         seen = set()
 
@@ -283,7 +507,6 @@ def extract_from_google_results(page: Page, company_name: str, country: str) -> 
                 href = link.get_attribute("href")
                 if not href or "google.com" in href or "accounts.google" in href or href in seen:
                     continue
-                # Skip non-http
                 if not href.startswith("http"):
                     continue
                 parsed = urlparse(href)
@@ -295,10 +518,15 @@ def extract_from_google_results(page: Page, company_name: str, country: str) -> 
             except Exception:
                 continue
 
-        # Pick best URL
+        # Pick best URL: prefer organic links, fallback to AI Overview domains
         if candidate_urls:
             best = pick_best_website(candidate_urls[:15], company_name, country)
             result.website = best
+        elif ai_text and ai_domains:
+            # No good links from results; use domain from AI Overview
+            best = pick_best_website(ai_domains, company_name, country)
+            if best:
+                result.website = best
     except Exception as e:
         logger.warning("Error extracting from Google results: %s", e)
 
@@ -426,6 +654,8 @@ def process_company(
     playwright_context: Any,
     company: CompanyInput,
     block_ads: bool = True,
+    use_duckduckgo: bool = False,
+    headless: bool = True,
 ) -> CompanyResult:
     """Process a single company: Google search + website scrape."""
     result = CompanyResult(
@@ -433,7 +663,7 @@ def process_company(
         country=company.country,
         sector=company.sector,
     )
-    browser = playwright_context.chromium.launch(headless=True)
+    browser = playwright_context.chromium.launch(headless=headless)
     context = browser.new_context(
         viewport={"width": 1280, "height": 720},
         user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -448,30 +678,43 @@ def process_company(
         query = f'"{company.company_name}" {company.country} official website contact'
         logger.info("Searching: %s", query)
 
-        page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=15000)
-        _random_delay(1, 2)
-        handle_google_consent(page)
-        _random_delay(0.5, 1)
+        if use_duckduckgo:
+            candidate_urls, search_result = extract_from_duckduckgo(
+                page, company.company_name, company.country
+            )
+        else:
+            page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=15000)
+            _random_delay(1, 2)
+            handle_google_consent(page)
+            _random_delay(0.5, 1)
 
-        # Search
-        search_box = page.get_by_role("combobox", name=re.compile("search", re.I))
-        if search_box.count() == 0:
-            search_box = page.locator('textarea[name="q"], input[name="q"]')
-        search_box.first.fill(query)
-        _random_delay(0.3, 0.7)
-        search_box.first.press("Enter")
-        page.wait_for_load_state("domcontentloaded")
-        _random_delay(2, 3)
+            # Search - try Google first
+            search_box = page.get_by_role("combobox", name=re.compile("search", re.I))
+            if search_box.count() == 0:
+                search_box = page.locator('textarea[name="q"], input[name="q"]')
+            search_box.first.fill(query)
+            _random_delay(0.3, 0.7)
+            search_box.first.press("Enter")
+            page.wait_for_load_state("domcontentloaded")
+            _random_delay(2, 3)
 
-        candidate_urls, google_result = extract_from_google_results(
-            page, company.company_name, company.country
-        )
-        result.website = google_result.website
-        result.emails = google_result.emails
-        result.phones = google_result.phones
-        result.address = google_result.address or ""
-        result.social_links = google_result.social_links
-        result.source = google_result.source
+            # Detect CAPTCHA and fallback to DuckDuckGo
+            if is_google_captcha_page(page):
+                logger.warning("Google showed CAPTCHA - falling back to DuckDuckGo")
+                candidate_urls, search_result = extract_from_duckduckgo(
+                    page, company.company_name, company.country
+                )
+            else:
+                candidate_urls, search_result = extract_from_google_results(
+                    page, company.company_name, company.country
+                )
+
+        result.website = search_result.website
+        result.emails = search_result.emails
+        result.phones = search_result.phones
+        result.address = search_result.address or ""
+        result.social_links = search_result.social_links
+        result.source = search_result.source
 
         # Visit official website if we found one
         if result.website:
@@ -569,6 +812,8 @@ def main() -> None:
     parser.add_argument("-o", "--output", default="company_contacts", help="Output base path (without extension)")
     parser.add_argument("--no-block", action="store_true", help="Do not block images/ads (slower)")
     parser.add_argument("--max", type=int, default=0, help="Max companies to process (0=all)")
+    parser.add_argument("--duckduckgo", action="store_true", help="Use DuckDuckGo instead of Google (avoids CAPTCHA)")
+    parser.add_argument("--headed", action="store_true", help="Run browser in headed mode (visible)")
     args = parser.parse_args()
 
     companies = load_companies(args.input)
@@ -580,7 +825,12 @@ def main() -> None:
     with sync_playwright() as p:
         for i, company in enumerate(companies, 1):
             logger.info("[%d/%d] Processing: %s", i, len(companies), company.company_name)
-            result = process_company(p, company, block_ads=not args.no_block)
+            result = process_company(
+                p, company,
+                block_ads=not args.no_block,
+                use_duckduckgo=args.duckduckgo,
+                headless=not args.headed,
+            )
             results.append(result)
             # Brief pause between companies
             if i < len(companies):
