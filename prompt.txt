@@ -1,0 +1,58 @@
+You are a senior automation engineer.
+
+Write a python Playwright script that does the following:
+
+INPUT:
+- A JSON or CSV list of companies with fields:
+  - company_name
+  - country
+  - sector
+
+TASK:
+For each company:
+1. Open Google Search (https://www.google.com)
+2. Search using this query pattern:
+   "<company_name> <country> official website contact"
+3. Handle Google consent popup if it appears.
+4. From the search results page:
+   - Identify the most likely official website (exclude LinkedIn, Facebook, Crunchbase, Wikipedia, news sites).
+   - Extract visible contact details directly from Google if available:
+     - Emails
+     - Phone numbers
+     - Address
+     - Website URL
+5. Open the identified official website in a new page.
+6. Try to locate a "Contact", "Contact Us", "About", or footer section.
+7. Extract:
+   - Email addresses (mailto links and visible text)
+   - Phone numbers
+   - Physical address
+   - Social media links (LinkedIn, Twitter, Facebook)
+8. Normalize and deduplicate the extracted data.
+
+OUTPUT:
+- Save results into a structured JSON file with this schema:
+  {
+    company_name,
+    country,
+    sector,
+    website,
+    emails: [],
+    phones: [],
+    address,
+    social_links: [],
+    source: ["google", "website"]
+  }
+
+TECHNICAL REQUIREMENTS:
+- Use Playwright with Chromium
+- Use realistic delays and waitForSelector to avoid detection
+- Use regex to extract emails and phone numbers
+- Gracefully handle missing data and timeouts
+- Log failures and continue processing the next company
+- Do NOT hardcode selectors that are too brittle
+
+BONUS:
+- Add a helper function to score and pick the best website URL
+- Block images and ads for faster scraping
+- Export a CSV in addition to JSON
